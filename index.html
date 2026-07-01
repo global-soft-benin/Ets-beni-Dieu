@@ -1182,7 +1182,14 @@ const db   = firebase.firestore();
 db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
 
 /* ============================================================
-   2. ÉTAT GLOBAL
+   2. ADMINISTRATEUR PRINCIPAL (RECONNU AUTOMATIQUEMENT)
+   Cet email sera toujours admin, sans configuration Firebase manuelle.
+   ============================================================ */
+const ADMIN_EMAIL = 'richbenidieuboh1@gmail.com';
+const ADMIN_INFO  = { prenom:'Béni Dieu', nom:'BOH', telephone:'96126647', email:ADMIN_EMAIL, role:'admin' };
+
+/* ============================================================
+   3. ÉTAT GLOBAL
    ============================================================ */
 const App = {
   user:null, role:null, userData:null,
@@ -1302,11 +1309,34 @@ async function doLogout(){
 auth.onAuthStateChanged(async user=>{
   if(user){
     App.user=user;
-    try{
-      const snap=await db.collection('users').doc(user.uid).get();
-      if(snap.exists){App.userData=snap.data();App.role=App.userData.role||'vendeur';}
-      else{App.userData={email:user.email,role:'vendeur',nom:'',prenom:''};App.role='vendeur';}
-    }catch(e){App.userData={email:user.email,role:'vendeur',nom:'',prenom:''};App.role='vendeur';}
+
+    // ── Reconnaissance automatique de l'administrateur principal ──
+    // Si l'email correspond à l'admin principal, on lui donne
+    // automatiquement le rôle admin SANS configuration Firestore manuelle.
+    if(user.email===ADMIN_EMAIL){
+      App.role='admin';
+      App.userData={...ADMIN_INFO, uid:user.uid};
+      // Créer/mettre à jour le profil Firestore en arrière-plan (silencieusement)
+      db.collection('users').doc(user.uid).set(
+        {...ADMIN_INFO, updatedAt:fmt.ts()},{merge:true}
+      ).catch(()=>{});
+    } else {
+      // Pour tous les autres comptes, lire le profil dans Firestore
+      try{
+        const snap=await db.collection('users').doc(user.uid).get();
+        if(snap.exists){
+          App.userData=snap.data();
+          App.role=App.userData.role||'vendeur';
+        }else{
+          App.userData={email:user.email,role:'vendeur',nom:'',prenom:''};
+          App.role='vendeur';
+        }
+      }catch(e){
+        App.userData={email:user.email,role:'vendeur',nom:'',prenom:''};
+        App.role='vendeur';
+      }
+    }
+
     document.getElementById('authScreen').style.display='none';
     document.getElementById('app').style.display='flex';
     applyRoleUI();
@@ -1314,7 +1344,7 @@ auth.onAuthStateChanged(async user=>{
     goTo('dashboard');
     setupStockAlerts();
     document.getElementById('dashDate').textContent=fmt.today();
-    await logAction('CONNEXION');
+    try{await logAction('CONNEXION');}catch(e){}
   }else{
     App.user=null;App.role=null;App.userData=null;App.cart=[];
     App.listeners.forEach(u=>u());App.listeners=[];
@@ -1398,10 +1428,20 @@ async function loadDashboard(){
     const monthStart=new Date(now.getFullYear(),now.getMonth(),1);
     const yearStart=new Date(now.getFullYear(),0,1);
 
-    let q=db.collection('ventes').orderBy('createdAt','desc').limit(500);
-    if(App.role==='vendeur')q=q.where('vendeurId','==',App.user.uid);
+    // ── Requêtes sans orderBy pour éviter les erreurs d'index Firestore ──
+    let ventesQ=db.collection('ventes').limit(500);
+    if(App.role==='vendeur')ventesQ=ventesQ.where('vendeurId','==',App.user.uid);
 
-    const [vSnap,aSnap]=await Promise.all([q.get(),db.collection('articles').get()]);
+    let vSnap,aSnap;
+    try{[vSnap,aSnap]=await Promise.all([ventesQ.get(),db.collection('articles').get()]);}
+    catch(e){
+      // Si erreur de permissions, afficher le tableau vide proprement
+      document.getElementById('dash-loading').style.display='none';
+      document.getElementById('dash-content').style.display='';
+      toast('Activez les règles Firestore (voir README)','warning',6000);
+      return;
+    }
+
     const ventes=vSnap.docs.map(d=>({id:d.id,...d.data()}));
     const articles=aSnap.docs.map(d=>({id:d.id,...d.data()}));
     App.allArticles=articles;
@@ -1431,7 +1471,6 @@ async function loadDashboard(){
     }
     const topVds=Object.entries(vdSales).sort((a,b)=>b[1]-a[1]).slice(0,5);
 
-    // CA mensuel
     const months={};for(let m=0;m<12;m++){months[`${now.getFullYear()}-${String(m+1).padStart(2,'0')}`]=0;}
     yearV.forEach(v=>{const k=gts(v).toISOString().slice(0,7);if(months[k]!==undefined)months[k]+=v.total||0;});
 
@@ -1450,12 +1489,12 @@ async function loadDashboard(){
 
     document.getElementById('top-products-list').innerHTML=topProds.map(([n,d],i)=>
       `<div class="top-item"><span class="top-rank">${i+1}</span><div class="top-info"><div class="top-name">${n}</div><div class="top-sub">${fmt.n(d.qte)} unités</div></div><div class="top-value">${fmt.fc(d.total)}</div></div>`
-    ).join('')||'<div class="empty-state-sm">Aucune vente</div>';
+    ).join('')||'<div class="empty-state-sm">Aucune vente pour l\'instant</div>';
 
     if(App.role!=='vendeur')
       document.getElementById('top-vendeurs-list').innerHTML=topVds.map(([n,t],i)=>
         `<div class="top-item"><span class="top-rank">${i+1}</span><div class="top-info"><div class="top-name">${n}</div></div><div class="top-value">${fmt.fc(t)}</div></div>`
-      ).join('')||'<div class="empty-state-sm">Aucune vente</div>';
+      ).join('')||'<div class="empty-state-sm">Aucune vente pour l\'instant</div>';
 
     document.getElementById('stock-alerts-list').innerHTML=alerts.slice(0,6).map(a=>
       `<div class="alert-item ${a.stock_disponible===0?'critical':'low'}">
@@ -1467,7 +1506,14 @@ async function loadDashboard(){
 
     document.getElementById('dash-loading').style.display='none';
     document.getElementById('dash-content').style.display='';
-  }catch(e){console.error(e);toast('Erreur tableau de bord','error');document.getElementById('dash-loading').style.display='none';document.getElementById('dash-content').style.display='';}
+  }catch(e){
+    console.error('Dashboard error:',e);
+    document.getElementById('dash-loading').style.display='none';
+    document.getElementById('dash-content').style.display='';
+    // Afficher les stats à zéro au lieu de crasher
+    ['stat-today','stat-week','stat-month','stat-year','stat-stock'].forEach(id=>document.getElementById(id).textContent='0 FCFA');
+    ['stat-count','stat-alert','stat-rupture'].forEach(id=>document.getElementById(id).textContent='0');
+  }
 }
 
 function buildChart(id,config){
